@@ -182,22 +182,34 @@ class DataFeed:
         
         Returns: True if successful, False if failed
         """
-        sym = _ws_symbol(SYMBOL).upper()
+        # Convert symbol: "BTC/USDT:USDT" → "BTCUSDT"
+        base = SYMBOL.split("/")[0].upper()
+        quote = SYMBOL.split("/")[1].split(":")[0].upper()
+        sym = base + quote
+        
+        logger.info(f"📍 Using symbol: {sym}")
+        
         max_retries = 3
         
         for attempt in range(max_retries):
             try:
                 logger.info(f"📥 Snapshot attempt {attempt + 1}/{max_retries}...")
                 
-                r = requests.get(
-                    f"{_REST_BASE}/fapi/v1/depth",
-                    params={"symbol": sym, "limit": 5000},
-                    timeout=10,
-                )
+                # Build URL manually to ensure correct parameter formatting
+                url = f"{_REST_BASE}/fapi/v1/depth"
+                params = {
+                    "symbol": sym,
+                    "limit": 1000  # Binance allows: 5, 10, 20, 50, 100, 500, 1000, 5000
+                }
+                
+                logger.debug(f"🔗 GET {url}?symbol={sym}&limit={params['limit']}")
+                
+                r = requests.get(url, params=params, timeout=10)
                 
                 # Check for HTTP errors
                 if r.status_code != 200:
-                    logger.error(f"❌ HTTP {r.status_code}: {r.text}")
+                    error_text = r.text
+                    logger.error(f"❌ HTTP {r.status_code}: {error_text}")
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)  # exponential backoff
                     continue
@@ -218,7 +230,8 @@ class DataFeed:
                     self._bids = {float(p): float(q) for p, q in data["bids"] if float(q) > 0}
                     self._asks = {float(p): float(q) for p, q in data["asks"] if float(q) > 0}
                     self._last_update_id = data["lastUpdateId"]
-                    logger.info(f"📚 Book loaded: lastUpdateId={self._last_update_id}")
+                    logger.info(f"📚 Book loaded: lastUpdateId={self._last_update_id}, "
+                              f"Bids={len(self._bids)}, Asks={len(self._asks)}")
                     self._update_mid()
 
                 # Drain any buffered diffs (shouldn't be many)
