@@ -17,8 +17,9 @@ CHART_LEVELS        = 20                   # max depth levels to display
 BIG_WALL_MULTIPLIER = 3.0                  # wall = 3× average bucket qty
 MIN_ZONE_STRENGTH   = 3                    # min buckets in a cluster
 
-# ── Liquidity Zone Confirmation (NEW) ─────────────────────────────
-ZONE_BAND_WIDTH_PCT = 0.02                 # ±0.02% = zone price band half-width
+# ── Liquidity Zone Confirmation (DATA-DRIVEN BANDS) ────────────────
+# Zone band = actual price range where orders cluster (START → PEAK → DROP)
+# Not a fixed percentage, but extracted from orderbook structure
 ZONE_CONFIRM_STRENGTH = 5.0                # strength score (0-10) to lock zone
 ZONE_CONFIRMATION_SNAPS = 10               # minimum snapshots before locking
 ZONE_MISS_LIMIT     = 10                   # snapshots before locked zone removed
