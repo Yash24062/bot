@@ -28,7 +28,7 @@ def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
 
-# ── Section renderers ─────────────────────────────────────────────
+# ── Section renderers ───────��─────────────────────────────────────
 
 def _header(mid_price, momentum):
     now  = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
@@ -64,7 +64,7 @@ def _bin_side(levels, mid_price, side):
 
 
 def _orderbook(bids, asks, mid_price, zones):
-    zone_prices = [z.price for z in zones]
+    zone_mids = [z.price_mid for z in zones]
 
     binned = (
         [("ask", p, q) for p, q in _bin_side(asks, mid_price, "ask")] +
@@ -87,7 +87,7 @@ def _orderbook(bids, asks, mid_price, zones):
         col  = G if side == "bid" else R
         lbl  = "BID" if side == "bid" else "ASK"
         star = (f" {Y}★{RESET}" if any(
-            abs(price - zp) / max(zp, 1) < BIN_PCT * 6 for zp in zone_prices)
+            abs(price - zm) / max(zm, 1) < BIN_PCT * 6 for zm in zone_mids)
             else "  ")
         mid  = (f" {C}◀ MID{RESET}" if abs(price - mid_price) / max(mid_price, 1)
                 < BIN_PCT * 3 else "")
@@ -116,24 +116,26 @@ def _live_trades(trades):
 def _zones(zones, mid_price):
     print(f"  {B}CONFIRMED LIQUIDITY ZONES{RESET}")
     if not zones:
-        print(f"  {D}  Building zone registry... (needs {3} snapshots){RESET}\n")
+        print(f"  {D}  Building zone registry... (needs strength to lock){RESET}\n")
         return
-    print(f"  {'Side':5} {'Price':>12} {'Qty':>9} {'Type':14} "
-          f"{'Visits':7} {'Broken':7} {'Retest':6} {'Dist':6}")
-    print(f"  {'─'*5} {'─'*12} {'─'*9} {'─'*14} "
-          f"{'─'*7} {'─'*7} {'─'*6} {'─'*6}")
+    print(f"  {'Side':5} {'Price':>12} {'Band':>11} {'Qty':>9} {'Strength':8} "
+          f"{'Visits':7} {'Broken':7} {'Dist':6}")
+    print(f"  {'─'*5} {'─'*12} {'─'*11} {'─'*9} {'─'*8} "
+          f"{'─'*7} {'─'*7} {'─'*6}")
     for z in zones[:8]:
         col  = G if z.side == "bid" else R
         brk  = f"{R}BROKEN{RESET}" if z.broken else f"{G}intact{RESET}"
-        ret  = f"{Y}YES{RESET}" if z.retest else "no"
         spf  = f" {Y}⚠SPOOF{RESET}" if getattr(z, 'suspected_spoof', False) else ""
-        dist = abs(mid_price - z.price) / mid_price * 100
+        dist = z.distance_to_zone(mid_price) / max(z.price_mid, 1) * 100
+        band = f"${z.price_low:,.2f}-${z.price_high:,.2f}"
+        strength = f"{z.strength_score:.1f}/10"
         print(f"  {col}{z.side.upper():5}{RESET} "
-              f"{col}{z.price:>12,.2f}{RESET} "
-              f"{z.total_qty:>9.3f} "
-              f"{z.zone_type:14} "
+              f"{col}{z.price_mid:>12,.2f}{RESET} "
+              f"{band:>11} "
+              f"{z.latest_qty:>9.3f} "
+              f"{strength:8} "
               f"{'★'*min(z.touches,5):7} "
-              f"{brk}  {ret:6}  {dist:.3f}%{spf}")
+              f"{brk}  {dist:.3f}%{spf}")
     print()
 
 
