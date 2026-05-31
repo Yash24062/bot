@@ -4,65 +4,103 @@
 #  PIPELINE EACH TICK:
 #    1. Bin raw orderbook into 0.01% price buckets
 #    2. Find walls + clusters in the binned data
-#    3. Match raw zones to persistent registry
-#       - Zone confirmed after ZONE_CONFIRM_SNAPS appearances
-#       - Zone removed after ZONE_MISS_LIMIT consecutive misses
-#    4. Update touch / break / retest state (edge-based, not level)
+#    3. Match raw zones to persistent registry with LOCKED bands
+#       - Pending zones build strength score (0-10 scale)
+#       - Zone locked after reaching ZONE_CONFIRM_STRENGTH
+#       - Locked zones never change price band
+#       - Locked zone removed only after ZONE_MISS_LIMIT misses
+#    4. Update touch / break / retest state (edge-based, zone band)
 #    5. Smooth momentum over rolling window
-#    6. Generate signals only on confirmed zones with momentum
+#    6. Generate signals only on confirmed (locked) zones with momentum
 # ================================================================
 
 from collections import deque, defaultdict
+from datetime import datetime
 from config import (
     BIG_WALL_MULTIPLIER, MIN_ZONE_STRENGTH,
     VOLUME_SPIKE_MULT, IMBALANCE_THRESHOLD, MOMENTUM_WINDOW,
     TP_FALLBACK_PCT, SL_FALLBACK_PCT, MIN_RR_RATIO,
     REVERSAL_TOUCHES_NEEDED, TAKER_FEE_PCT, LEVERAGE,
-    BIN_PCT, ZONE_CONFIRM_SNAPS, ZONE_MISS_LIMIT, ZONE_PROXIMITY_PCT,
+    BIN_PCT, ZONE_CONFIRM_STRENGTH, ZONE_CONFIRMATION_SNAPS,
+    ZONE_MISS_LIMIT, ZONE_PROXIMITY_PCT, ZONE_BAND_WIDTH_PCT,
     SPOOF_DROP_PCT, SPOOF_CONFIRM_SNAPS, SPOOF_RECOVER_SNAPS,
     TOUCH_COOLDOWN_PCT, TP_SKIP_TO_NEXT,
 )
 
 
-class LiquidityZone:
+class ConfirmedLiquidityZone:
+    """
+    A LOCKED zone with a price band, not a single price.
+    Once locked, the zone's price boundaries never change.
+    Statistics (qty, touches) are tracked but don't affect the zone's validity.
+    """
     def __init__(self, bucket_price, total_qty, zone_type, side):
-        self.price     = bucket_price
-        self.total_qty = total_qty
-        self.zone_type = zone_type    # "wall" | "cluster" | "wall+cluster"
-        self.side      = side         # "bid" | "ask"
-
+        # Locked properties (set at creation, never change)
+        band_hw = bucket_price * ZONE_BAND_WIDTH_PCT / 2
+        self.price_low   = bucket_price - band_hw
+        self.price_high  = bucket_price + band_hw
+        self.price_mid   = bucket_price
+        self.band_width  = ZONE_BAND_WIDTH_PCT
+        
+        self.zone_type   = zone_type    # "wall" | "cluster" | "wall+cluster"
+        self.side        = side         # "bid" | "ask"
+        self.confirmed_at = datetime.now()
+        
+        # Initial snapshot for tracking
+        self.initial_qty = total_qty
+        self.latest_qty  = total_qty
+        
         # Registry state
         self.seen_count   = 1
         self.missed_count = 0
-        self.confirmed    = False
-
+        self.strength_score = 0.0  # 0-10 scale; >= ZONE_CONFIRM_STRENGTH = locked
+        
         # Trade state
         self.touches   = 0
         self.broken    = False
         self.retest    = False
         self._inside   = False        # was price inside this zone last tick?
-
+        
         # Touch cooldown — price must leave by TOUCH_COOLDOWN_PCT before next touch
-        self._cooldown_active = False  # True while waiting for price to leave zone
-
+        self._cooldown_active = False
+        
         # Anti-spoof tracking
         self._prev_qty          = total_qty
-        self._spoof_shrink_snaps = 0   # consecutive snaps where qty dropped > SPOOF_DROP_PCT
-        self._spoof_stable_snaps = 0   # consecutive snaps of stable/growing qty
+        self._spoof_shrink_snaps = 0
+        self._spoof_stable_snaps = 0
         self.suspected_spoof    = False
-
+    
+    @property
+    def is_locked(self):
+        """Zone is locked once strength reaches threshold."""
+        return self.strength_score >= ZONE_CONFIRM_STRENGTH
+    
+    def contains_price(self, price):
+        """Check if price is within this zone's band."""
+        return self.price_low <= price <= self.price_high
+    
+    def distance_to_zone(self, price):
+        """Return distance from price to nearest edge of zone band."""
+        if self.contains_price(price):
+            return 0
+        return min(
+            abs(price - self.price_low),
+            abs(price - self.price_high)
+        )
+    
     def __repr__(self):
-        st    = "CONFIRMED" if self.confirmed else f"pending({self.seen_count})"
+        lock_status = "LOCKED" if self.is_locked else f"PENDING({self.strength_score:.1f})"
         spoof = " ⚠SPOOF?" if self.suspected_spoof else ""
-        return (f"Zone({self.side.upper()} ${self.price:,.2f} "
-                f"qty={self.total_qty:.3f} {self.zone_type} "
-                f"touches={self.touches} broken={self.broken} [{st}]{spoof})")
+        return (f"Zone({self.side.upper()} ${self.price_mid:,.2f} "
+                f"[${self.price_low:,.2f}-${self.price_high:,.2f}] "
+                f"qty={self.latest_qty:.3f} {self.zone_type} "
+                f"touches={self.touches} broken={self.broken} [{lock_status}]{spoof})")
 
 
 class Analyser:
     def __init__(self):
-        self._registry = {}       # key → LiquidityZone
-        self.zones     = []       # confirmed zones only, sorted by qty desc
+        self._registry = {}       # key → ConfirmedLiquidityZone
+        self.zones     = []       # locked zones only, sorted by qty desc
         self.momentum  = {
             "imbalance": 0.5, "volume_spike": False, "bias": "neutral",
             "bid_vol": 0, "ask_vol": 0, "recent_vol": 0, "avg_vol": 0,
@@ -85,9 +123,10 @@ class Analyser:
 
         self._update_registry(raw)
 
+        # Only include LOCKED zones
         self.zones = sorted(
-            [z for z in self._registry.values() if z.confirmed],
-            key=lambda z: z.total_qty, reverse=True
+            [z for z in self._registry.values() if z.is_locked],
+            key=lambda z: z.latest_qty, reverse=True
         )[:12]
 
         self._update_state(mid_price)
@@ -100,7 +139,8 @@ class Analyser:
             if z.suspected_spoof:
                 continue
 
-            prox = abs(mid_price - z.price) / max(z.price, 1)
+            # Distance from price to nearest edge of zone band
+            prox = z.distance_to_zone(mid_price) / max(z.price_mid, 1)
 
             # ── Reversal ──────────────────────────────────────────
             if (not z.broken
@@ -212,44 +252,101 @@ class Analyser:
                             "zone_type": "cluster", "side": side})
         return raw
 
-    # ── Step 3: Registry update ───────────────────────────────────
+    # ── Step 3: Registry update with LOCKED zones ─────────────────
 
     def _update_registry(self, raw_zones):
+        """
+        Match raw zones to persistent registry.
+        - Locked zones: match by band containment
+        - Pending zones: match by proximity, build strength
+        - New zones: create with 0 strength
+        """
         matched = set()
 
         for rz in raw_zones:
+            # Try locked zone first
+            lock_key = self._find_locked_zone(rz["price"], rz["side"])
+            if lock_key:
+                z = self._registry[lock_key]
+                z.seen_count += 1
+                z.missed_count = 0
+                # Update stats only, never the price band
+                self._update_spoof(z, rz["qty"])
+                z.latest_qty = z.latest_qty * 0.7 + rz["qty"] * 0.3
+                z.zone_type = rz["zone_type"]  # Track type changes but don't affect band
+                matched.add(lock_key)
+                continue
+
+            # Try pending zone (proximity match)
             key = self._find_key(rz["price"], rz["side"])
             if key:
                 z = self._registry[key]
-                new_qty        = rz["qty"]
-                z.seen_count  += 1
+                z.seen_count += 1
                 z.missed_count = 0
-                # Anti-spoof: check if qty dropped sharply without price contact
-                self._update_spoof(z, new_qty)
-                # EMA-smooth quantity to prevent jumpy values
-                z.total_qty = z.total_qty * 0.7 + new_qty * 0.3
+                # Build strength score
+                self._update_strength(z, rz)
+                # Update stats
+                self._update_spoof(z, rz["qty"])
+                z.latest_qty = z.latest_qty * 0.7 + rz["qty"] * 0.3
                 z.zone_type = rz["zone_type"]
-                if z.seen_count >= ZONE_CONFIRM_SNAPS:
-                    z.confirmed = True
                 matched.add(key)
-            else:
-                new_key = f"{rz['side']}:{rz['price']:.4f}"
-                self._registry[new_key] = LiquidityZone(
-                    rz["price"], rz["qty"], rz["zone_type"], rz["side"])
-                matched.add(new_key)
+                continue
 
+            # New zone (not yet tracked)
+            new_key = f"{rz['side']}:{rz['price']:.4f}"
+            self._registry[new_key] = ConfirmedLiquidityZone(
+                rz["price"], rz["qty"], rz["zone_type"], rz["side"])
+            matched.add(new_key)
+
+        # Cleanup: remove unmatched zones
         to_remove = []
         for key, z in self._registry.items():
             if key in matched:
                 continue
-            if z.confirmed:
+            if z.is_locked:
+                # Locked zone missed — increment counter
                 z.missed_count += 1
                 if z.missed_count >= ZONE_MISS_LIMIT:
                     to_remove.append(key)
             else:
+                # Pending zone lost — remove immediately
                 to_remove.append(key)
         for k in to_remove:
             del self._registry[k]
+
+    def _update_strength(self, z, rz):
+        """
+        Build confidence score (0-10) for zone confirmation.
+        Checks: consistency, stability, and price proximity.
+        """
+        score_delta = 0
+
+        # Reward: consistent zone type
+        if z.zone_type == rz["zone_type"]:
+            score_delta += 0.3
+        else:
+            score_delta -= 0.1  # Type changed (slight penalty)
+
+        # Reward: stable volume (not collapsing like spoof)
+        qty_ratio = rz["qty"] / max(z.latest_qty, 1)
+        if 0.5 <= qty_ratio <= 2.0:  # Reasonable range
+            score_delta += 0.4
+        elif qty_ratio < 0.5:  # Sudden collapse
+            score_delta -= 0.3  # Suspicious
+        else:
+            score_delta += 0.1  # Growing is ok
+
+        # Reward: price stays near zone center
+        price_error = abs(rz["price"] - z.price_mid) / z.price_mid
+        if price_error < BIN_PCT * 2:  # Within 2 bins
+            score_delta += 0.3
+        elif price_error < BIN_PCT * 5:  # Within 5 bins (acceptable drift)
+            score_delta += 0.1
+        else:
+            score_delta -= 0.2  # Drifting too far
+
+        z.strength_score += score_delta
+        z.strength_score = max(0, min(10, z.strength_score))  # Clamp [0, 10]
 
     def _update_spoof(self, z, new_qty):
         """Track sudden wall-size collapses to detect spoofing."""
@@ -275,17 +372,27 @@ class Analyser:
 
         z._prev_qty = new_qty
 
-    def _find_key(self, price, side):
+    def _find_locked_zone(self, price, side):
+        """Find an existing LOCKED zone containing this price."""
         for key, z in self._registry.items():
-            if z.side == side and abs(z.price - price) / max(z.price, 1) <= BIN_PCT * 5:
+            if z.side == side and z.is_locked and z.contains_price(price):
                 return key
+        return None
+
+    def _find_key(self, price, side):
+        """Find pending (not yet locked) zone by proximity."""
+        for key, z in self._registry.items():
+            if z.side == side and not z.is_locked:
+                if abs(z.price_mid - price) / max(z.price_mid, 1) <= BIN_PCT * 5:
+                    return key
         return None
 
     # ── Step 4: Touch / break / retest ────────────────────────────
 
     def _update_state(self, mid_price):
         for z in self.zones:
-            prox   = abs(mid_price - z.price) / max(z.price, 1)
+            # Distance from price to nearest edge of zone band
+            prox = z.distance_to_zone(mid_price) / max(z.price_mid, 1)
             inside = prox < ZONE_PROXIMITY_PCT
 
             # Touch cooldown: once price enters, require it to leave by
@@ -306,11 +413,11 @@ class Analyser:
 
             z._inside = inside
 
-            # Mark broken when price passes cleanly through
+            # Mark broken when price passes cleanly through zone band
             if not z.broken:
-                if z.side == "ask" and mid_price > z.price * (1 + ZONE_PROXIMITY_PCT * 2):
+                if z.side == "ask" and mid_price > z.price_high * (1 + ZONE_PROXIMITY_PCT):
                     z.broken = True
-                elif z.side == "bid" and mid_price < z.price * (1 - ZONE_PROXIMITY_PCT * 2):
+                elif z.side == "bid" and mid_price < z.price_low * (1 - ZONE_PROXIMITY_PCT):
                     z.broken = True
 
     # ── Step 5: Momentum ──────────────────────────────────────────
@@ -366,17 +473,17 @@ class Analyser:
 
         # ── SL first (needed to evaluate RR per TP candidate) ─────
         if side == "BUY":
-            below = [z for z in self.zones if z.side == "bid" and z.price < entry_price
+            below = [z for z in self.zones if z.side == "bid" and z.price_mid < entry_price
                      and not z.suspected_spoof]
             if below:
-                sl_zone  = max(below, key=lambda z: z.price)
-                sl_price = sl_zone.price * (1 - BIN_PCT * 2)
+                sl_zone  = max(below, key=lambda z: z.price_mid)
+                sl_price = sl_zone.price_low * (1 - BIN_PCT * 2)
         else:
-            above = [z for z in self.zones if z.side == "ask" and z.price > entry_price
+            above = [z for z in self.zones if z.side == "ask" and z.price_mid > entry_price
                      and not z.suspected_spoof]
             if above:
-                sl_zone  = min(above, key=lambda z: z.price)
-                sl_price = sl_zone.price * (1 + BIN_PCT * 2)
+                sl_zone  = min(above, key=lambda z: z.price_mid)
+                sl_price = sl_zone.price_high * (1 + BIN_PCT * 2)
 
         # Fallback SL so we can compute RR while scanning TP zones
         sl_for_rr = sl_price
@@ -389,25 +496,25 @@ class Analyser:
         # ── TP scan ───────────────────────────────────────────────
         if side == "BUY":
             candidates = sorted(
-                [z for z in self.zones if z.side == "ask" and z.price > entry_price
+                [z for z in self.zones if z.side == "ask" and z.price_mid > entry_price
                  and not z.suspected_spoof],
-                key=lambda z: z.price)
+                key=lambda z: z.price_mid)
         else:
             candidates = sorted(
-                [z for z in self.zones if z.side == "bid" and z.price < entry_price
+                [z for z in self.zones if z.side == "bid" and z.price_mid < entry_price
                  and not z.suspected_spoof],
-                key=lambda z: z.price, reverse=True)
+                key=lambda z: z.price_mid, reverse=True)
 
         for z in candidates:
             if side == "BUY":
-                ctp      = z.price * (1 - BIN_PCT * 2)
+                ctp      = z.price_high * (1 - BIN_PCT * 2)
                 move_pct = (ctp - entry_price) / entry_price
             else:
-                ctp      = z.price * (1 + BIN_PCT * 2)
+                ctp      = z.price_low * (1 + BIN_PCT * 2)
                 move_pct = (entry_price - ctp) / entry_price
 
             if move_pct < MIN_TP_MOVE:
-                tp_skip = (f"Zone @${z.price:,.2f} skipped — "
+                tp_skip = (f"Zone @${z.price_mid:,.2f} skipped — "
                            f"move {move_pct*100:.3f}% < fee floor {MIN_TP_MOVE*100:.3f}%")
                 continue
 
@@ -415,7 +522,7 @@ class Analyser:
             rr_candidate = reward / risk_base if risk_base > 0 else 0
 
             if TP_SKIP_TO_NEXT and rr_candidate < MIN_RR_RATIO:
-                tp_skip = (f"Zone @${z.price:,.2f} skipped — "
+                tp_skip = (f"Zone @${z.price_mid:,.2f} skipped — "
                            f"RR {rr_candidate:.2f} < {MIN_RR_RATIO} min")
                 continue
 
