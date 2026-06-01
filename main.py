@@ -19,6 +19,7 @@ def main():
     analyser   = Analyser()
     trader     = Trader()
     action_log = []
+    MAX_LOG_SIZE = 1000  # FIX: Prevent unbounded memory growth
 
     feed.start()
 
@@ -51,6 +52,9 @@ def main():
             new_actions = trader.evaluate(signals, mid_price)
             if new_actions:
                 action_log.extend(new_actions)
+                # FIX: Keep log size bounded (trimmed FIFO if exceeded)
+                if len(action_log) > MAX_LOG_SIZE:
+                    action_log = action_log[-MAX_LOG_SIZE:]
 
             ui.render(
                 orderbook  = orderbook,
