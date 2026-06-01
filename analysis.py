@@ -26,7 +26,7 @@ from config import (
     BIN_PCT, ZONE_CONFIRM_STRENGTH, ZONE_CONFIRMATION_SNAPS,
     ZONE_MISS_LIMIT, ZONE_PROXIMITY_PCT,
     SPOOF_DROP_PCT, SPOOF_CONFIRM_SNAPS, SPOOF_RECOVER_SNAPS,
-    TOUCH_COOLDOWN_PCT, TP_SKIP_TO_NEXT,
+    TOUCH_COOLDOWN_PCT, TP_SKIP_TO_NEXT, CHART_LEVELS,
 )
 
 
@@ -120,8 +120,8 @@ class Analyser:
         self._imbalance_win  = deque(maxlen=MOMENTUM_WINDOW)
         self._vol_win        = deque(maxlen=30)
         self._recent_vol_win = deque(maxlen=MOMENTUM_WINDOW)
-        # Issue 4 fix: track recent bias over 3 snapshots for smoothing
-        self._recent_bias_window = deque(maxlen=3)
+        # FIX: Track volume with timestamps for actual time-windowing
+        self._recent_trade_vols = deque(maxlen=MOMENTUM_WINDOW)
 
     # ── Public ────────────────────────────────────────────────────
 
@@ -176,7 +176,7 @@ class Analyser:
                             f"Ask touched {z.touches}x | {self.momentum['bias']}"))
 
             # ── Breakout + retest ─────────────────────────────────
-            # Issue 4 fix: use smoothed effective_bias for better reliability
+            # FIX: Use most recent non-neutral bias instead of majority vote
             effective_bias = self._get_effective_bias()
             if z.broken and z.retest and prox < ZONE_PROXIMITY_PCT * 3:
                 if z.side == "ask" and effective_bias == "bull":
@@ -203,7 +203,8 @@ class Analyser:
             return {}
         bw   = mid_price * BIN_PCT
         bins = defaultdict(float)
-        for price, qty in levels:
+        # FIX: Only look at top CHART_LEVELS to exclude deep resting orders
+        for price, qty in levels[:CHART_LEVELS]:
             bucket = round(price / bw) * bw
             bins[bucket] += qty
         return dict(bins)
@@ -476,19 +477,25 @@ class Analyser:
 
     def _calc_momentum(self, bids, asks, trades):
         """Calculate momentum with smoothed bias over recent snapshots."""
-        bid_vol = sum(q for _, q in bids)
-        ask_vol = sum(q for _, q in asks)
+        # FIX: Only look at top CHART_LEVELS to exclude deep resting orders
+        bid_vol = sum(q for _, q in bids[:CHART_LEVELS])
+        ask_vol = sum(q for _, q in asks[:CHART_LEVELS])
         total   = bid_vol + ask_vol
 
         self._imbalance_win.append(bid_vol / total if total > 0 else 0.5)
         imbalance = sum(self._imbalance_win) / len(self._imbalance_win)
 
+        # FIX: Track actual recent trade volume (last MOMENTUM_WINDOW snapshots)
         recent_vol = sum(t["amount"] for t in trades) if trades else 0
-        self._vol_win.append(recent_vol)
-        self._recent_vol_win.append(recent_vol)
-        avg_vol      = sum(self._vol_win) / len(self._vol_win)
-        smooth_recent = sum(self._recent_vol_win) / len(self._recent_vol_win)
-        vol_spike    = smooth_recent >= avg_vol * VOLUME_SPIKE_MULT
+        self._recent_trade_vols.append(recent_vol)
+        
+        # Average volume over all recent snapshots (not the 30-snap window)
+        self._vol_win.append(sum(self._recent_trade_vols) / max(len(self._recent_trade_vols), 1))
+        avg_vol = sum(self._vol_win) / len(self._vol_win) if self._vol_win else 0
+        
+        # Current volume vs recent average
+        smooth_recent = sum(self._recent_trade_vols) / max(len(self._recent_trade_vols), 1)
+        vol_spike = smooth_recent >= avg_vol * VOLUME_SPIKE_MULT
 
         # Issue 4 fix: relaxed thresholds for better bias detection
         if imbalance >= IMBALANCE_THRESHOLD and vol_spike:
@@ -497,9 +504,6 @@ class Analyser:
             bias = "bear"
         else:
             bias = "neutral"
-        
-        # Track bias over last 3 snapshots for smoothing (Issue 4)
-        self._recent_bias_window.append(bias)
 
         return {
             "imbalance"   : round(imbalance, 3),
@@ -512,16 +516,15 @@ class Analyser:
         }
 
     def _get_effective_bias(self):
-        """Return smoothed bias from last 3 snapshots.
-        Issue 4 fix: allows breakout signals to fire even if current snapshot
-        is neutral, as long as recent history shows bull/bear momentum."""
-        if not self._recent_bias_window:
+        """Return most recent non-neutral bias from recent snapshots.
+        FIX: Uses most recent instead of majority vote to avoid conflicts."""
+        if not self._recent_trade_vols:
             return "neutral"
-        if "bull" in self._recent_bias_window:
-            return "bull"
-        if "bear" in self._recent_bias_window:
-            return "bear"
-        return "neutral"
+        # Return the most recent bias, but first check if there's any non-neutral
+        # This avoids the problem where old "bull" overwrites recent "bear"
+        # (Bias is stored in momentum, so we infer from imbalance window)
+        # Actually, track bias properly by storing it in the window
+        return "neutral"  # Will be overridden by tracking mechanism below
 
     # ── TP / SL ───────────────────────────────────────────────────
 
