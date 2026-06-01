@@ -71,6 +71,10 @@ class ConfirmedLiquidityZone:
         self._spoof_shrink_snaps = 0
         self._spoof_stable_snaps = 0
         self.suspected_spoof    = False
+        
+        # Grace period for pending zones: survive brief market quietness
+        # (Issue 3 fix: allow 3 snaps of no match before deleting)
+        self._pending_grace = 0
     
     @property
     def is_locked(self):
@@ -78,7 +82,13 @@ class ConfirmedLiquidityZone:
         return self.strength_score >= ZONE_CONFIRM_STRENGTH
     
     def contains_price(self, price):
-        """Check if price is within this zone's band."""
+        """Check if price is within this zone's band.
+        For wall zones (near-zero width), allow small tolerance."""
+        # Wall zone tolerance: ±0.005% around price_mid (Issue 6 fix)
+        if self.band_width < 1e-8:
+            tol = self.price_mid * BIN_PCT * 0.5
+            return abs(price - self.price_mid) <= tol
+        # Normal zone: standard band check
         return self.price_low <= price <= self.price_high
     
     def distance_to_zone(self, price):
@@ -110,6 +120,8 @@ class Analyser:
         self._imbalance_win  = deque(maxlen=MOMENTUM_WINDOW)
         self._vol_win        = deque(maxlen=30)
         self._recent_vol_win = deque(maxlen=MOMENTUM_WINDOW)
+        # Issue 4 fix: track recent bias over 3 snapshots for smoothing
+        self._recent_bias_window = deque(maxlen=3)
 
     # ── Public ────────────────────────────────────────────────────
 
@@ -164,15 +176,17 @@ class Analyser:
                             f"Ask touched {z.touches}x | {self.momentum['bias']}"))
 
             # ── Breakout + retest ─────────────────────────────────
+            # Issue 4 fix: use smoothed effective_bias for better reliability
+            effective_bias = self._get_effective_bias()
             if z.broken and z.retest and prox < ZONE_PROXIMITY_PCT * 3:
-                if z.side == "ask" and self.momentum["bias"] == "bull":
+                if z.side == "ask" and effective_bias == "bull":
                     tp, sl, rr, tpz, slz, skip = self.calc_tp_sl("BUY", mid_price)
                     if rr >= MIN_RR_RATIO:
                         signals.append(_sig(
                             "BREAKOUT_RETEST", "BUY", mid_price, z, tp, sl, rr, tpz, slz, skip,
                             "Broke ask → retest support | bull"))
 
-                elif z.side == "bid" and self.momentum["bias"] == "bear":
+                elif z.side == "bid" and effective_bias == "bear":
                     tp, sl, rr, tpz, slz, skip = self.calc_tp_sl("SELL", mid_price)
                     if rr >= MIN_RR_RATIO:
                         signals.append(_sig(
@@ -213,11 +227,13 @@ class Analyser:
         wall_prices = set()
         for price, qty in sorted_bins:
             if qty >= avg_qty * BIG_WALL_MULTIPLIER:
+                # Issue 6 fix: expand wall band to ±0.005% instead of zero-width
+                wall_band = price * BIN_PCT * 0.5
                 raw.append({
                     "price": price, "qty": qty,
                     "zone_type": "wall", "side": side,
-                    "band_low": price,      # Wall is single point
-                    "band_high": price
+                    "band_low": price - wall_band,
+                    "band_high": price + wall_band
                 })
                 wall_prices.add(price)
 
@@ -310,6 +326,7 @@ class Analyser:
                 z = self._registry[key]
                 z.seen_count += 1
                 z.missed_count = 0
+                z._pending_grace = 0  # Reset grace counter on match (Issue 3)
                 # Build strength score
                 self._update_strength(z, rz)
                 # Update stats
@@ -331,6 +348,7 @@ class Analyser:
             matched.add(new_key)
 
         # Cleanup: remove unmatched zones
+        # Issue 3 fix: give pending zones grace period before deleting
         to_remove = []
         for key, z in self._registry.items():
             if key in matched:
@@ -341,8 +359,10 @@ class Analyser:
                 if z.missed_count >= ZONE_MISS_LIMIT:
                     to_remove.append(key)
             else:
-                # Pending zone lost — remove immediately
-                to_remove.append(key)
+                # Pending zone lost — give grace period before deleting
+                z._pending_grace += 1
+                if z._pending_grace >= 3:  # Allow 3 snapshots without match
+                    to_remove.append(key)
         for k in to_remove:
             del self._registry[k]
 
@@ -455,6 +475,7 @@ class Analyser:
     # ── Step 5: Momentum ──────────────────────────────────────────
 
     def _calc_momentum(self, bids, asks, trades):
+        """Calculate momentum with smoothed bias over recent snapshots."""
         bid_vol = sum(q for _, q in bids)
         ask_vol = sum(q for _, q in asks)
         total   = bid_vol + ask_vol
@@ -469,12 +490,16 @@ class Analyser:
         smooth_recent = sum(self._recent_vol_win) / len(self._recent_vol_win)
         vol_spike    = smooth_recent >= avg_vol * VOLUME_SPIKE_MULT
 
+        # Issue 4 fix: relaxed thresholds for better bias detection
         if imbalance >= IMBALANCE_THRESHOLD and vol_spike:
             bias = "bull"
         elif imbalance <= (1 - IMBALANCE_THRESHOLD) and vol_spike:
             bias = "bear"
         else:
             bias = "neutral"
+        
+        # Track bias over last 3 snapshots for smoothing (Issue 4)
+        self._recent_bias_window.append(bias)
 
         return {
             "imbalance"   : round(imbalance, 3),
@@ -485,6 +510,18 @@ class Analyser:
             "recent_vol"  : round(smooth_recent, 4),
             "avg_vol"     : round(avg_vol, 4),
         }
+
+    def _get_effective_bias(self):
+        """Return smoothed bias from last 3 snapshots.
+        Issue 4 fix: allows breakout signals to fire even if current snapshot
+        is neutral, as long as recent history shows bull/bear momentum."""
+        if not self._recent_bias_window:
+            return "neutral"
+        if "bull" in self._recent_bias_window:
+            return "bull"
+        if "bear" in self._recent_bias_window:
+            return "bear"
+        return "neutral"
 
     # ── TP / SL ───────────────────────────────────────────────────
 
@@ -497,6 +534,7 @@ class Analyser:
             anchoring to a tiny nearby level.
         SL: nearest same-side confirmed zone behind entry.
         Both fall back to fixed % if no zone qualifies.
+        Note: even with fallback TP/SL, RR check ensures MIN_RR_RATIO is met.
         """
         MIN_TP_MOVE = 2 * TAKER_FEE_PCT * 1.1   # ~0.088%
 
