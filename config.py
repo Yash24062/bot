@@ -23,7 +23,7 @@ MIN_ZONE_STRENGTH   = 3                    # min buckets in a cluster
 ZONE_CONFIRM_STRENGTH = 5.0                # strength score (0-10) to lock zone
 ZONE_CONFIRMATION_SNAPS = 10               # minimum snapshots before locking
 ZONE_MISS_LIMIT     = 10                   # snapshots before locked zone removed
-ZONE_PROXIMITY_PCT  = 0.0003               # 0.03% = zone touch distance
+ZONE_PROXIMITY_PCT  = 0.003                # 0.3% = zone touch distance
 
 # ── Momentum ──────────────────────────────────────────────────────
 MOMENTUM_WINDOW     = 20                   # rolling window size
