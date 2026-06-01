@@ -4,10 +4,12 @@
 #  PIPELINE EACH TICK:
 #    1. Bin raw orderbook into 0.01% price buckets
 #    2. Find walls + clusters in the binned data
+#       - Detect DATA-DRIVEN bands: where orders START → PEAK → DROP
 #    3. Match raw zones to persistent registry with LOCKED bands
 #       - Pending zones build strength score (0-10 scale)
 #       - Zone locked after reaching ZONE_CONFIRM_STRENGTH
-#       - Locked zones never change price band
+#       - Locked zones never change price band (immutable)
+#       - Band can expand if new data shows wider clustering
 #       - Locked zone removed only after ZONE_MISS_LIMIT misses
 #    4. Update touch / break / retest state (edge-based, zone band)
 #    5. Smooth momentum over rolling window
@@ -22,7 +24,7 @@ from config import (
     TP_FALLBACK_PCT, SL_FALLBACK_PCT, MIN_RR_RATIO,
     REVERSAL_TOUCHES_NEEDED, TAKER_FEE_PCT, LEVERAGE,
     BIN_PCT, ZONE_CONFIRM_STRENGTH, ZONE_CONFIRMATION_SNAPS,
-    ZONE_MISS_LIMIT, ZONE_PROXIMITY_PCT, ZONE_BAND_WIDTH_PCT,
+    ZONE_MISS_LIMIT, ZONE_PROXIMITY_PCT,
     SPOOF_DROP_PCT, SPOOF_CONFIRM_SNAPS, SPOOF_RECOVER_SNAPS,
     TOUCH_COOLDOWN_PCT, TP_SKIP_TO_NEXT,
 )
@@ -30,17 +32,17 @@ from config import (
 
 class ConfirmedLiquidityZone:
     """
-    A LOCKED zone with a price band, not a single price.
-    Once locked, the zone's price boundaries never change.
-    Statistics (qty, touches) are tracked but don't affect the zone's validity.
+    A LOCKED zone with DATA-DRIVEN band based on actual orderbook clustering.
+    Band = price range where orders START to increase → PEAK → DROP.
+    Once locked, the zone's price boundaries are IMMUTABLE (never change).
+    Band can expand if new data reveals wider clustering.
     """
-    def __init__(self, bucket_price, total_qty, zone_type, side):
-        # Locked properties (set at creation, never change)
-        band_hw = bucket_price * ZONE_BAND_WIDTH_PCT / 2
-        self.price_low   = bucket_price - band_hw
-        self.price_high  = bucket_price + band_hw
-        self.price_mid   = bucket_price
-        self.band_width  = ZONE_BAND_WIDTH_PCT
+    def __init__(self, bucket_price, total_qty, zone_type, side, band_low, band_high):
+        # Locked properties (set from actual data, never change after lock)
+        self.price_low   = band_low      # Where orders START to cluster
+        self.price_high  = band_high     # Where orders STOP clustering
+        self.price_mid   = bucket_price  # Volume-weighted center
+        self.band_width  = band_high - band_low
         
         self.zone_type   = zone_type    # "wall" | "cluster" | "wall+cluster"
         self.side        = side         # "bid" | "ask"
@@ -192,9 +194,14 @@ class Analyser:
             bins[bucket] += qty
         return dict(bins)
 
-    # ── Step 2: Raw zone detection ────────────────────────────────
+    # ── Step 2: Raw zone detection with DATA-DRIVEN bands ────────
 
     def _raw_zones(self, bins, side):
+        """
+        Detect zones from binned orderbook.
+        Zone BAND = actual price range where orders cluster.
+        Band: from where orders START to increase → where they PEAK → where they DROP.
+        """
         if not bins:
             return []
         qtys    = list(bins.values())
@@ -202,15 +209,19 @@ class Analyser:
         sorted_bins = sorted(bins.items())
         raw = []
 
-        # Walls: buckets with outsized single-level volume
+        # ── Walls: single buckets with massive volume ─────────────
         wall_prices = set()
         for price, qty in sorted_bins:
             if qty >= avg_qty * BIG_WALL_MULTIPLIER:
-                raw.append({"price": price, "qty": qty,
-                            "zone_type": "wall", "side": side})
+                raw.append({
+                    "price": price, "qty": qty,
+                    "zone_type": "wall", "side": side,
+                    "band_low": price,      # Wall is single point
+                    "band_high": price
+                })
                 wall_prices.add(price)
 
-        # Clusters: runs of adjacent non-empty buckets
+        # ── Clusters: runs of adjacent high-volume buckets ────────
         groups, current = [], []
         for price, qty in sorted_bins:
             if qty < avg_qty * 0.5:
@@ -236,7 +247,14 @@ class Analyser:
             total = sum(q for _, q in grp)
             if total < avg_qty * BIG_WALL_MULTIPLIER * 0.8:
                 continue
+            
+            # Zone CENTER = volume-weighted average price
             centre = sum(p * q for p, q in grp) / sum(q for _, q in grp)
+            
+            # Zone BAND = actual price range of the cluster
+            # From first price in cluster to last price in cluster
+            band_low = min(p for p, _ in grp)
+            band_high = max(p for p, _ in grp)
 
             # Upgrade wall to wall+cluster if they overlap
             upgraded = False
@@ -245,11 +263,20 @@ class Analyser:
                         and abs(r["price"] - centre) / max(centre, 1) < BIN_PCT * 5):
                     r["zone_type"] = "wall+cluster"
                     r["qty"] = max(r["qty"], total)
+                    # Expand band to encompass both wall and cluster
+                    r["band_low"] = min(r["band_low"], band_low)
+                    r["band_high"] = max(r["band_high"], band_high)
                     upgraded = True
                     break
+            
             if not upgraded:
-                raw.append({"price": centre, "qty": total,
-                            "zone_type": "cluster", "side": side})
+                raw.append({
+                    "price": centre, "qty": total,
+                    "zone_type": "cluster", "side": side,
+                    "band_low": band_low,
+                    "band_high": band_high
+                })
+        
         return raw
 
     # ── Step 3: Registry update with LOCKED zones ─────────────────
@@ -257,9 +284,9 @@ class Analyser:
     def _update_registry(self, raw_zones):
         """
         Match raw zones to persistent registry.
-        - Locked zones: match by band containment
-        - Pending zones: match by proximity, build strength
-        - New zones: create with 0 strength
+        - Locked zones: match by band containment (immutable bands)
+        - Pending zones: match by proximity, build strength, expand band
+        - New zones: create with DATA-DRIVEN band from cluster
         """
         matched = set()
 
@@ -270,10 +297,10 @@ class Analyser:
                 z = self._registry[lock_key]
                 z.seen_count += 1
                 z.missed_count = 0
-                # Update stats only, never the price band
+                # Update stats only, never the price band (locked)
                 self._update_spoof(z, rz["qty"])
                 z.latest_qty = z.latest_qty * 0.7 + rz["qty"] * 0.3
-                z.zone_type = rz["zone_type"]  # Track type changes but don't affect band
+                z.zone_type = rz["zone_type"]
                 matched.add(lock_key)
                 continue
 
@@ -289,13 +316,18 @@ class Analyser:
                 self._update_spoof(z, rz["qty"])
                 z.latest_qty = z.latest_qty * 0.7 + rz["qty"] * 0.3
                 z.zone_type = rz["zone_type"]
+                # EXPAND band if new data shows wider clustering
+                z.price_low = min(z.price_low, rz["band_low"])
+                z.price_high = max(z.price_high, rz["band_high"])
+                z.band_width = z.price_high - z.price_low
                 matched.add(key)
                 continue
 
-            # New zone (not yet tracked)
+            # New zone with DATA-DRIVEN band
             new_key = f"{rz['side']}:{rz['price']:.4f}"
             self._registry[new_key] = ConfirmedLiquidityZone(
-                rz["price"], rz["qty"], rz["zone_type"], rz["side"])
+                rz["price"], rz["qty"], rz["zone_type"], rz["side"],
+                rz["band_low"], rz["band_high"])
             matched.add(new_key)
 
         # Cleanup: remove unmatched zones
