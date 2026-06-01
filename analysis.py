@@ -528,6 +528,7 @@ class Analyser:
     def calc_tp_sl(self, side, entry_price):
         """
         TP: scan qualifying opposing zones in order from nearest to farthest.
+            TP = just BEFORE zone entry (at near edge), not inside zone band.
             Skip zones where resulting RR < MIN_RR_RATIO (not just fee floor).
             With TP_SKIP_TO_NEXT=True this keeps trying further zones until
             we find one that delivers a worthwhile reward, rather than always
@@ -577,10 +578,12 @@ class Analyser:
 
         for z in candidates:
             if side == "BUY":
-                ctp      = z.price_high * (1 - BIN_PCT * 2)
+                # TP just BEFORE ask zone entry (at near edge, price_low)
+                ctp      = z.price_low * (1 - BIN_PCT * 2)
                 move_pct = (ctp - entry_price) / entry_price
             else:
-                ctp      = z.price_low * (1 + BIN_PCT * 2)
+                # TP just BEFORE bid zone entry (at near edge, price_high)
+                ctp      = z.price_high * (1 + BIN_PCT * 2)
                 move_pct = (entry_price - ctp) / entry_price
 
             if move_pct < MIN_TP_MOVE:
